@@ -6,6 +6,7 @@ import time
 import traceback
 from datetime import datetime
 import argparse
+import urllib.request
 from flask import Flask, render_template_string, jsonify, render_template
 
 class CommaWebListener:
@@ -16,6 +17,8 @@ class CommaWebListener:
         self.last_update = 0
         self.running = True
         self.device_ip = None
+        self.webrtc_url = None
+        self.webrtc_enabled = False
 
     def start_listening(self):
         """启动UDP监听"""
@@ -30,7 +33,15 @@ class CommaWebListener:
                     data, addr = sock.recvfrom(4096)
                     self.device_ip = addr[0]
                     try:
-                        self.data = json.loads(data.decode('utf-8'))
+                        parsed_data = json.loads(data.decode('utf-8'))
+                        self.data = parsed_data
+
+                        # 检查是否有WebRTC功能并更新URL
+                        if "webrtc" in parsed_data and parsed_data["webrtc"]:
+                            self.webrtc_enabled = parsed_data["webrtc"].get("enabled", False)
+                            self.webrtc_url = parsed_data["webrtc"].get("url", "")
+                            print(f"WebRTC状态: {'启用' if self.webrtc_enabled else '禁用'}, URL: {self.webrtc_url}")
+
                         self.last_update = time.time()
                     except json.JSONDecodeError:
                         print(f"接收到无效的JSON数据: {data[:100]}...")
@@ -151,6 +162,19 @@ HTML_TEMPLATE = """
             white-space: pre-wrap;
             word-break: break-all;
         }
+        #webrtc-container {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        #webrtc-video {
+            max-width: 100%;
+            border-radius: 8px;
+            margin-top: 15px;
+            background-color: #000;
+        }
+        .webrtc-controls {
+            margin: 15px 0;
+        }
     </style>
 </head>
 <body>
@@ -161,6 +185,20 @@ HTML_TEMPLATE = """
 
         <div id="status-container" class="status waiting">
             等待来自comma3的数据...
+        </div>
+
+        <div id="webrtc-container" style="display: none;">
+            <div class="card">
+                <div class="card-header">Comma3 屏幕实时画面</div>
+                <div class="card-body">
+                    <div class="webrtc-status" id="webrtc-status">未连接</div>
+                    <div class="webrtc-controls">
+                        <button class="btn btn-primary" id="start-webrtc">开始屏幕共享</button>
+                        <button class="btn btn-danger" id="stop-webrtc" disabled>停止屏幕共享</button>
+                    </div>
+                    <video id="webrtc-video" autoplay playsinline muted></video>
+                </div>
+            </div>
         </div>
 
         <div class="controls">
@@ -330,6 +368,92 @@ HTML_TEMPLATE = """
         let map, marker;
         let lastValidLatLng = null;
         let activeTab = 'car';  // 默认显示车辆信息标签
+        let pc = null;  // WebRTC对等连接
+
+        // WebRTC相关变量
+        const videoElement = document.getElementById('webrtc-video');
+        const startButton = document.getElementById('start-webrtc');
+        const stopButton = document.getElementById('stop-webrtc');
+        const statusElement = document.getElementById('webrtc-status');
+        let webrtcUrl = null;
+
+        // 设置WebRTC按钮事件
+        if (startButton && stopButton) {
+            startButton.addEventListener('click', startWebRTC);
+            stopButton.addEventListener('click', stopWebRTC);
+        }
+
+        // 启动WebRTC连接
+        async function startWebRTC() {
+            if (pc || !webrtcUrl) {
+                return;
+            }
+
+            try {
+                startButton.disabled = true;
+                stopButton.disabled = false;
+                statusElement.textContent = '正在连接...';
+
+                pc = new RTCPeerConnection({
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:stun1.l.google.com:19302' }
+                    ]
+                });
+
+                pc.addEventListener('track', function(evt) {
+                    if (evt.track.kind == 'video') {
+                        videoElement.srcObject = evt.streams[0];
+                        statusElement.textContent = '已连接';
+                    }
+                });
+
+                pc.addEventListener('connectionstatechange', function() {
+                    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                        stopWebRTC();
+                    }
+                });
+
+                // 创建offer
+                const offer = await pc.createOffer({
+                    offerToReceiveVideo: true
+                });
+                await pc.setLocalDescription(offer);
+
+                // 发送offer到服务器
+                const response = await fetch(`${webrtcUrl}/offer`, {
+                    body: JSON.stringify({
+                        sdp: pc.localDescription.sdp,
+                        type: pc.localDescription.type
+                    }),
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    method: 'POST'
+                });
+
+                // 处理服务器返回的answer
+                const answer = await response.json();
+                await pc.setRemoteDescription(answer);
+            } catch (e) {
+                console.error('WebRTC连接失败:', e);
+                statusElement.textContent = `连接失败: ${e.message}`;
+                stopWebRTC();
+            }
+        }
+
+        // 停止WebRTC连接
+        function stopWebRTC() {
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+
+            videoElement.srcObject = null;
+            startButton.disabled = false;
+            stopButton.disabled = true;
+            statusElement.textContent = '已断开';
+        }
 
         // 根据车辆状态自动切换标签
         function autoSwitchTabs(isCarActive) {
@@ -714,10 +838,12 @@ HTML_TEMPLATE = """
                 .then(response => response.json())
                 .then(data => {
                     const statusContainer = document.getElementById('status-container');
+                    const webrtcContainer = document.getElementById('webrtc-container');
 
                     if (!data || !data.data || Object.keys(data.data).length === 0) {
                         statusContainer.className = 'status waiting';
                         statusContainer.textContent = '等待来自comma3的数据...';
+                        webrtcContainer.style.display = 'none';
                         return;
                     }
 
@@ -725,12 +851,32 @@ HTML_TEMPLATE = """
                     if (currentTime - data.last_update > 5) {
                         statusContainer.className = 'status expired';
                         statusContainer.textContent = `数据已过期! 上次更新: ${new Date(data.last_update * 1000).toLocaleTimeString()}`;
+                        webrtcContainer.style.display = 'none';
                         return;
                     }
 
                     // 数据有效，更新UI
                     statusContainer.className = 'status connected';
                     statusContainer.textContent = `已连接到 ${data.device_ip || 'Comma3设备'} - 最后更新: ${new Date(data.last_update * 1000).toLocaleTimeString()}`;
+
+                    // 检查WebRTC功能
+                    if (data.webrtc_enabled && data.webrtc_url) {
+                        webrtcContainer.style.display = 'block';
+                        // 更新WebRTC URL，如果变化了
+                        if (webrtcUrl !== data.webrtc_url) {
+                            webrtcUrl = data.webrtc_url;
+                            console.log(`WebRTC URL更新: ${webrtcUrl}`);
+                            // 如果连接已经建立，重新连接
+                            if (pc) {
+                                stopWebRTC();
+                            }
+                        }
+                    } else {
+                        webrtcContainer.style.display = 'none';
+                        if (pc) {
+                            stopWebRTC();
+                        }
+                    }
 
                     // 获取数据
                     const carData = data.data.car || {};
@@ -762,6 +908,7 @@ HTML_TEMPLATE = """
                     console.error('获取数据出错:', error);
                     document.getElementById('status-container').className = 'status expired';
                     document.getElementById('status-container').textContent = '连接错误: ' + error.message;
+                    document.getElementById('webrtc-container').style.display = 'none';
                 });
         }
 
@@ -820,7 +967,9 @@ def create_app(listener):
         return jsonify({
             'data': listener.data,
             'last_update': listener.last_update,
-            'device_ip': listener.device_ip
+            'device_ip': listener.device_ip,
+            'webrtc_enabled': listener.webrtc_enabled,
+            'webrtc_url': listener.webrtc_url
         })
 
     return app
@@ -847,6 +996,7 @@ def main():
     # 启动Web服务器
     try:
         print(f"Web服务已启动，请访问 http://{args.host}:{args.web_port}/")
+        print("等待来自comma3的数据连接...")
         app.run(host=args.host, port=args.web_port)
     except KeyboardInterrupt:
         print("\n退出...")
