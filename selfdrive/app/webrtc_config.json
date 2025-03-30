@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "port": 8089,
+  "fps": 10,
+  "width": 640,
+  "height": 360,
+  "use_https": false,
+  "stun_servers": [
+    "stun:stun.l.google.com:19302",
+    "stun:stun1.l.google.com:19302"
+  ],
+  "comments": "这是WebRTC功能的配置文件，可根据需要修改参数"
+}

@@ -10,17 +10,362 @@ import time
 import traceback
 import zmq
 from datetime import datetime
+import cv2
+import numpy as np
+import asyncio
+import logging
 
 import cereal.messaging as messaging
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.params import Params
 from openpilot.system.hardware import PC, TICI
+
+# WebRTC 相关库
+try:
+    import aiohttp
+    from aiohttp import web
+    from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+    from aiortc.contrib.media import MediaPlayer, MediaRelay
+    import av
+    HAS_WEBRTC = True
+except ImportError:
+    print("WebRTC 相关库未安装，屏幕共享功能将不可用")
+    HAS_WEBRTC = False
+
 try:
   from selfdrive.car.car_helpers import interfaces
   HAS_CAR_INTERFACES = True
 except ImportError:
   HAS_CAR_INTERFACES = False
   interfaces = None
+
+# 设置日志级别
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("CommaAssist")
+
+# 加载WebRTC配置
+def load_webrtc_config():
+    """加载WebRTC配置文件，如果不存在则使用默认值"""
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webrtc_config.json")
+    default_config = {
+        "enabled": True,
+        "port": 8089,
+        "fps": 10,
+        "width": 640,
+        "height": 360,
+        "use_https": False,
+        "stun_servers": ["stun:stun.l.google.com:19302"]
+    }
+
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                logger.info(f"已加载WebRTC配置: {config_path}")
+                # 合并默认配置，确保所有必要的字段都存在
+                for key, value in default_config.items():
+                    if key not in config:
+                        config[key] = value
+                return config
+    except Exception as e:
+        logger.error(f"加载WebRTC配置失败: {e}")
+
+    logger.info("使用WebRTC默认配置")
+    return default_config
+
+# 全局WebRTC配置
+WEBRTC_CONFIG = load_webrtc_config()
+
+# WebRTC 视频流相关类
+class CommaVideoStreamTrack(VideoStreamTrack):
+    """
+    用于捕获并发送设备屏幕的视频流
+    """
+    def __init__(self, fps=10, width=640, height=360):
+        super().__init__()
+        self.fps = fps
+        self.width = width
+        self.height = height
+        self.counter = 0
+        self.last_frame_time = time.time()
+
+        # 在 comma3 上，使用截屏命令获取屏幕内容
+        self.is_comma3 = TICI
+
+        # 初始化计数器和帧率控制
+        self.frame_count = 0
+        self.start_time = time.time()
+
+    async def next_timestamp(self):
+        """控制帧率"""
+        self.counter += 1
+        wait_time = 1 / self.fps
+        current_time = time.time()
+        elapsed = current_time - self.last_frame_time
+
+        if elapsed < wait_time:
+            await asyncio.sleep(wait_time - elapsed)
+
+        self.last_frame_time = time.time()
+        return self.counter
+
+    async def recv(self):
+        """获取并返回下一帧视频"""
+        pts, time_base = await self.next_timestamp(), av.VideoDupedFrameSource.time_base
+
+        try:
+            # 在 comma3 上使用截屏命令
+            if self.is_comma3:
+                # 使用 screenshot 命令抓取屏幕
+                os.system("screenshot /tmp/comma_screen.png")
+                img = cv2.imread("/tmp/comma_screen.png")
+                if img is None:
+                    # 如果截图失败，生成一个黑色画面
+                    img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            else:
+                # 在其他设备上，可能需要其他方式获取屏幕内容
+                # 这里暂时生成一个测试画面
+                img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+                cv2.putText(img, f"CommaAssist Screen {self.counter}", (50, self.height // 2),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+            # 调整图像大小以降低带宽需求
+            img = cv2.resize(img, (self.width, self.height))
+
+            # 转换为 aiortc 可用的帧格式
+            frame = av.VideoFrame.from_ndarray(img, format="bgr24")
+            frame.pts = pts
+            frame.time_base = time_base
+
+            # 计算实际帧率
+            self.frame_count += 1
+            elapsed = time.time() - self.start_time
+            if elapsed > 5:  # 每5秒记录一次实际帧率
+                logger.info(f"实际视频帧率: {self.frame_count / elapsed:.2f} fps")
+                self.frame_count = 0
+                self.start_time = time.time()
+
+            return frame
+        except Exception as e:
+            logger.error(f"获取视频帧时出错: {e}")
+            # 出错时返回黑色画面
+            img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            cv2.putText(img, "Error", (self.width // 2 - 40, self.height // 2),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            frame = av.VideoFrame.from_ndarray(img, format="bgr24")
+            frame.pts = pts
+            frame.time_base = time_base
+            return frame
+
+# WebRTC 服务类
+class WebRTCServer:
+    def __init__(self, host='0.0.0.0', port=8089, fps=10, width=640, height=360, stun_servers=None):
+        self.host = host
+        self.port = port
+        self.pcs = set()
+        self.video_track = None
+        self.fps = fps
+        self.width = width
+        self.height = height
+        self.relay = MediaRelay()
+        self.app = None
+        self.runner = None
+        self.site = None
+        self.is_running = False
+        self.stun_servers = stun_servers or ["stun:stun.l.google.com:19302"]
+
+    async def offer(self, request):
+        """处理客户端的 WebRTC offer 请求"""
+        params = await request.json()
+        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+
+        pc = RTCPeerConnection(configuration={"iceServers": [{"urls": self.stun_servers}]})
+        self.pcs.add(pc)
+
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange():
+            logger.info(f"连接状态变更: {pc.connectionState}")
+            if pc.connectionState == "failed":
+                await pc.close()
+                self.pcs.discard(pc)
+
+        # 创建视频流
+        if self.video_track is None:
+            self.video_track = CommaVideoStreamTrack(fps=self.fps, width=self.width, height=self.height)
+
+        # 将视频流添加到对等连接
+        pc.addTrack(self.relay.subscribe(self.video_track))
+
+        # 设置本地描述
+        await pc.setRemoteDescription(offer)
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+
+        return web.json_response({
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type
+        })
+
+    async def on_shutdown(self, app):
+        """关闭所有对等连接"""
+        coros = [pc.close() for pc in self.pcs]
+        await asyncio.gather(*coros)
+        self.pcs.clear()
+
+    async def index(self, request):
+        """返回WebRTC客户端页面"""
+        html_content = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Comma3 屏幕共享</title>
+            <style>
+                body { margin: 0; padding: 20px; font-family: Arial, sans-serif; text-align: center; background-color: #f0f0f0; }
+                video { max-width: 100%; background-color: #000; border-radius: 8px; }
+                .container { max-width: 800px; margin: 0 auto; }
+                button { background-color: #4CAF50; border: none; color: white; padding: 10px 20px;
+                        text-align: center; text-decoration: none; display: inline-block; font-size: 16px;
+                        margin: 10px 2px; cursor: pointer; border-radius: 4px; }
+                button:disabled { background-color: #cccccc; }
+                .status { margin: 10px 0; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Comma3 屏幕共享</h1>
+                <div>
+                    <button id="start">开始</button>
+                    <button id="stop" disabled>停止</button>
+                </div>
+                <div class="status" id="status">未连接</div>
+                <video id="video" autoplay playsinline muted></video>
+            </div>
+
+            <script>
+                const videoElement = document.getElementById('video');
+                const startButton = document.getElementById('start');
+                const stopButton = document.getElementById('stop');
+                const statusElement = document.getElementById('status');
+                let pc = null;
+
+                startButton.addEventListener('click', start);
+                stopButton.addEventListener('click', stop);
+
+                async function start() {
+                    if (pc) {
+                        return;
+                    }
+
+                    try {
+                        startButton.disabled = true;
+                        stopButton.disabled = false;
+                        statusElement.textContent = '正在连接...';
+
+                        pc = new RTCPeerConnection({
+                            iceServers: [
+                                { urls: 'stun:stun.l.google.com:19302' },
+                                { urls: 'stun:stun1.l.google.com:19302' }
+                            ]
+                        });
+
+                        pc.addEventListener('track', function(evt) {
+                            if (evt.track.kind == 'video') {
+                                videoElement.srcObject = evt.streams[0];
+                                statusElement.textContent = '已连接';
+                            }
+                        });
+
+                        pc.addEventListener('connectionstatechange', function() {
+                            if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                                stop();
+                            }
+                        });
+
+                        // 创建offer
+                        const offer = await pc.createOffer({
+                            offerToReceiveVideo: true
+                        });
+                        await pc.setLocalDescription(offer);
+
+                        // 发送offer到服务器
+                        const response = await fetch('/offer', {
+                            body: JSON.stringify({
+                                sdp: pc.localDescription.sdp,
+                                type: pc.localDescription.type
+                            }),
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            method: 'POST'
+                        });
+
+                        // 处理服务器返回的answer
+                        const answer = await response.json();
+                        await pc.setRemoteDescription(answer);
+                    } catch (e) {
+                        console.error('连接失败:', e);
+                        stop();
+                    }
+                }
+
+                function stop() {
+                    if (pc) {
+                        pc.close();
+                        pc = null;
+                    }
+
+                    videoElement.srcObject = null;
+                    startButton.disabled = false;
+                    stopButton.disabled = true;
+                    statusElement.textContent = '已断开';
+                }
+
+                // 页面关闭时断开连接
+                window.addEventListener('beforeunload', function() {
+                    if (pc) {
+                        pc.close();
+                        pc = null;
+                    }
+                });
+            </script>
+        </body>
+        </html>
+        """
+        return web.Response(content_type="text/html", text=html_content)
+
+    async def start_server(self):
+        """启动WebRTC服务器"""
+        if not HAS_WEBRTC:
+            logger.error("未安装WebRTC相关库，无法启动WebRTC服务")
+            return
+
+        try:
+            self.is_running = True
+            self.app = web.Application()
+            self.app.on_shutdown.append(self.on_shutdown)
+            self.app.router.add_get("/", self.index)
+            self.app.router.add_post("/offer", self.offer)
+
+            self.runner = web.AppRunner(self.app)
+            await self.runner.setup()
+            self.site = web.TCPSite(self.runner, self.host, self.port)
+
+            logger.info(f"启动WebRTC服务器 {self.host}:{self.port}")
+            await self.site.start()
+        except Exception as e:
+            logger.error(f"启动WebRTC服务器失败: {e}")
+            self.is_running = False
+
+    async def stop_server(self):
+        """停止WebRTC服务器"""
+        if self.site:
+            await self.site.stop()
+        if self.runner:
+            await self.runner.cleanup()
+        self.is_running = False
+        logger.info("WebRTC服务器已停止")
 
 class CommaAssist:
   def __init__(self):
@@ -47,6 +392,36 @@ class CommaAssist:
 
     # 启动广播线程
     threading.Thread(target=self.broadcast_data).start()
+
+    # 初始化并启动WebRTC服务
+    if WEBRTC_CONFIG["enabled"] and HAS_WEBRTC:
+      self.webrtc_server = WebRTCServer(
+          host=self.get_local_ip(),
+          port=WEBRTC_CONFIG["port"],
+          fps=WEBRTC_CONFIG["fps"],
+          width=WEBRTC_CONFIG["width"],
+          height=WEBRTC_CONFIG["height"],
+          stun_servers=WEBRTC_CONFIG["stun_servers"]
+      )
+      self.start_webrtc_server()
+    else:
+      self.webrtc_server = None
+      print("WebRTC功能已禁用或相关库未安装")
+
+  def start_webrtc_server(self):
+    """启动WebRTC服务器"""
+    if HAS_WEBRTC and self.webrtc_server:
+      # 在单独的线程中启动异步WebRTC服务
+      def run_webrtc_server():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self.webrtc_server.start_server())
+        loop.run_forever()
+
+      threading.Thread(target=run_webrtc_server, daemon=True).start()
+      print(f"WebRTC服务器已在后台启动 (http://{self.get_local_ip()}:{WEBRTC_CONFIG['port']}/)")
+    else:
+      print("未安装WebRTC相关库，屏幕共享功能不可用")
 
   def load_car_info(self):
     """加载车辆基本信息"""
@@ -192,6 +567,10 @@ class CommaAssist:
           "wheelbase": f"{self.car_info.get('wheelbase', 0):.3f} m" if 'wheelbase' in self.car_info else "Unknown",
           "steering_ratio": f"{self.car_info.get('steerRatio', 0):.1f}" if 'steerRatio' in self.car_info else "Unknown"
         }
+      },
+      "webrtc": {
+        "enabled": HAS_WEBRTC and WEBRTC_CONFIG["enabled"],
+        "url": f"http://{self.ip_address}:{WEBRTC_CONFIG['port']}" if HAS_WEBRTC and WEBRTC_CONFIG["enabled"] else ""
       }
     }
 
@@ -492,6 +871,11 @@ def main(gctx=None):
       time.sleep(10)  # 主线程休眠
   except KeyboardInterrupt:
     comma_assist.is_running = False
+    # 停止WebRTC服务
+    if HAS_WEBRTC and comma_assist.webrtc_server and comma_assist.webrtc_server.is_running:
+      loop = asyncio.new_event_loop()
+      asyncio.set_event_loop(loop)
+      loop.run_until_complete(comma_assist.webrtc_server.stop_server())
     print("CommaAssist服务已停止")
 
 if __name__ == "__main__":
