@@ -9,7 +9,15 @@ import threading
 import time
 import traceback
 import zmq
+import base64
+import io
 from datetime import datetime
+from flask import Flask, Response, request
+from flask_socketio import SocketIO
+import eventlet
+
+from PyQt5.QtCore import Qt, QBuffer, QByteArray, QIODevice
+from PyQt5.QtGui import QImage
 
 import cereal.messaging as messaging
 from openpilot.common.realtime import Ratekeeper
@@ -21,6 +29,69 @@ try:
 except ImportError:
   HAS_CAR_INTERFACES = False
   interfaces = None
+
+# 全局变量
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+class ScreenCapture:
+  """屏幕捕获类，用于获取屏幕画面并转换为可传输的格式"""
+  def __init__(self, width=1280, height=720, fps=20, quality=70):
+    self.capture_width = width
+    self.capture_height = height
+    self.fps = fps
+    self.quality = quality
+    self.running = False
+
+  def capture_screen(self, root_widget):
+    """捕获屏幕画面并返回QImage"""
+    if root_widget is None:
+      return None
+    try:
+      # 使用QWidget的grab方法捕获屏幕
+      pixmap = root_widget.grab()
+      return pixmap.toImage()
+    except Exception as e:
+      print(f"屏幕捕获失败: {e}")
+      return None
+
+  def process_image(self, qimage):
+    """处理QImage图像"""
+    if qimage is None:
+      return None
+
+    # 调整图像大小
+    scaled_image = qimage.scaled(
+      self.capture_width,
+      self.capture_height,
+      Qt.KeepAspectRatio,
+      Qt.SmoothTransformation
+    )
+
+    return scaled_image
+
+  def get_jpeg_data(self, qimage):
+    """将QImage转换为JPEG数据"""
+    if qimage is None:
+      return None
+
+    # 创建字节数组缓冲区
+    byte_array = QByteArray()
+    buffer = QBuffer(byte_array)
+    buffer.open(QIODevice.WriteOnly)
+
+    # 保存为JPEG格式
+    qimage.save(buffer, "JPEG", self.quality)
+
+    return byte_array.data()
+
+  def get_base64_jpeg(self, qimage):
+    """将QImage转换为base64编码的JPEG"""
+    jpeg_data = self.get_jpeg_data(qimage)
+    if jpeg_data is None:
+      return None
+
+    return base64.b64encode(jpeg_data).decode('utf-8')
 
 class CommaAssist:
   def __init__(self):
@@ -41,12 +112,26 @@ class CommaAssist:
     self.ip_address = "0.0.0.0"
     self.is_running = True
 
+    # 视频流配置
+    self.video_port = 8089
+    self.screen_capture = ScreenCapture(width=1280, height=720, fps=15, quality=80)
+    self.video_streaming = False
+    self.root_widget = None
+    self.video_clients = set()
+
+    # Flask服务
+    self.flask_thread = None
+
     # 获取车辆信息
     self.car_info = {}
     self.load_car_info()
 
     # 启动广播线程
     threading.Thread(target=self.broadcast_data).start()
+
+    # 启动视频流线程
+    threading.Thread(target=self.start_video_server).start()
+    threading.Thread(target=self.video_capture_loop).start()
 
   def load_car_info(self):
     """加载车辆基本信息"""
@@ -192,6 +277,11 @@ class CommaAssist:
           "wheelbase": f"{self.car_info.get('wheelbase', 0):.3f} m" if 'wheelbase' in self.car_info else "Unknown",
           "steering_ratio": f"{self.car_info.get('steerRatio', 0):.1f}" if 'steerRatio' in self.car_info else "Unknown"
         }
+      },
+      "video_stream": {
+        "available": True,
+        "port": self.video_port,
+        "url": f"http://{self.ip_address}:{self.video_port}/video"
       }
     }
 
@@ -479,17 +569,130 @@ class CommaAssist:
         traceback.print_exc()
         time.sleep(1)
 
+  def start_video_server(self):
+    """启动视频流服务器"""
+    print(f"启动视频流服务器，端口: {self.video_port}")
+    try:
+      socketio.run(app, host='0.0.0.0', port=self.video_port)
+    except Exception as e:
+      print(f"视频流服务器启动失败: {e}")
+      traceback.print_exc()
+
+  def video_capture_loop(self):
+    """视频捕获循环"""
+    rk = Ratekeeper(self.screen_capture.fps, print_delay_threshold=None)
+    print("开始视频捕获循环")
+
+    while self.is_running:
+      try:
+        if len(self.video_clients) > 0 and self.root_widget is not None:
+          # 捕获屏幕
+          qimage = self.screen_capture.capture_screen(self.root_widget)
+          if qimage is not None:
+            # 处理图像
+            processed_image = self.screen_capture.process_image(qimage)
+            if processed_image is not None:
+              # 转换为base64编码的JPEG
+              base64_img = self.screen_capture.get_base64_jpeg(processed_image)
+              if base64_img is not None:
+                # 通过WebSocket发送
+                socketio.emit('video_frame', {'frame': base64_img})
+
+        rk.keep_time()
+      except Exception as e:
+        print(f"视频捕获错误: {e}")
+        traceback.print_exc()
+        time.sleep(1)
+
+  def update_screen(self):
+    """获取当前UI界面的根窗口"""
+    if self.root_widget is None:
+      try:
+        # 尝试获取当前窗口 (使用PyQt5直接方式)
+        from PyQt5.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app:
+          for widget in app.topLevelWidgets():
+            if widget.isVisible():
+              self.root_widget = widget
+              print("成功获取UI根窗口")
+              break
+      except Exception as e:
+        print(f"获取UI窗口失败: {e}")
+
+# 添加Socket.IO事件处理
+@socketio.on('connect')
+def handle_connect():
+    """处理客户端连接"""
+    comma_assist.video_clients.add(request.sid)
+    print(f"客户端连接: {request.sid}, 当前客户端数: {len(comma_assist.video_clients)}")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """处理客户端断开连接"""
+    try:
+        comma_assist.video_clients.remove(request.sid)
+    except KeyError:
+        pass
+    print(f"客户端断开: {request.sid}, 当前客户端数: {len(comma_assist.video_clients)}")
+
+# 视频流路由
+@app.route('/video')
+def video_feed():
+    """视频流页面"""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Comma3 实时视频流</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+        <style>
+            body { margin: 0; padding: 0; font-family: Arial, sans-serif; }
+            #video-container { width: 100%; max-width: 1280px; margin: 0 auto; }
+            #video-stream { width: 100%; height: auto; }
+            h1 { text-align: center; }
+        </style>
+    </head>
+    <body>
+        <h1>Comma3 实时视频流</h1>
+        <div id="video-container">
+            <img id="video-stream" src="" alt="等待视频流...">
+        </div>
+        <script>
+            const socket = io.connect(window.location.origin);
+            const img = document.getElementById('video-stream');
+
+            socket.on('video_frame', function(data) {
+                img.src = 'data:image/jpeg;base64,' + data.frame;
+            });
+
+            socket.on('connect', function() {
+                console.log('已连接到视频服务器');
+            });
+
+            socket.on('disconnect', function() {
+                console.log('与视频服务器断开连接');
+                img.src = '';
+            });
+        </script>
+    </body>
+    </html>
+    """
+
 def main(gctx=None):
   """主函数
   支持作为独立程序运行或由process_config启动
   gctx参数用于与openpilot进程管理系统兼容
   """
+  global comma_assist
   comma_assist = CommaAssist()
 
   # 保持主线程运行
   try:
     while True:
-      time.sleep(10)  # 主线程休眠
+      time.sleep(1)
+      comma_assist.update_screen()  # 定期更新屏幕对象
   except KeyboardInterrupt:
     comma_assist.is_running = False
     print("CommaAssist服务已停止")

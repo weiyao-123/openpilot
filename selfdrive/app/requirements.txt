@@ -1,0 +1,5 @@
+flask>=2.0.0
+Flask-SocketIO>=5.0.0
+eventlet>=0.30.0
+PyQt5>=5.15.0
+numpy>=1.20.0

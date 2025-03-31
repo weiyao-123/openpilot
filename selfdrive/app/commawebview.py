@@ -16,6 +16,8 @@ class CommaWebListener:
         self.last_update = 0
         self.running = True
         self.device_ip = None
+        self.video_stream_url = None
+        self.video_available = False
 
     def start_listening(self):
         """启动UDP监听"""
@@ -30,7 +32,19 @@ class CommaWebListener:
                     data, addr = sock.recvfrom(4096)
                     self.device_ip = addr[0]
                     try:
-                        self.data = json.loads(data.decode('utf-8'))
+                        json_data = json.loads(data.decode('utf-8'))
+                        self.data = json_data
+
+                        # 获取视频流信息
+                        if 'video_stream' in json_data:
+                            self.video_available = json_data['video_stream'].get('available', False)
+                            if self.video_available:
+                                self.video_stream_url = json_data['video_stream'].get('url')
+                                if not self.video_stream_url and 'port' in json_data['video_stream']:
+                                    # 如果没有提供完整URL，则构建一个
+                                    video_port = json_data['video_stream']['port']
+                                    self.video_stream_url = f"http://{self.device_ip}:{video_port}/video"
+
                         self.last_update = time.time()
                     except json.JSONDecodeError:
                         print(f"接收到无效的JSON数据: {data[:100]}...")
@@ -151,6 +165,39 @@ HTML_TEMPLATE = """
             white-space: pre-wrap;
             word-break: break-all;
         }
+        .video-container {
+            width: 100%;
+            height: 0;
+            padding-bottom: 56.25%; /* 16:9比例 */
+            position: relative;
+            background-color: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            margin-bottom: 20px;
+        }
+        .video-container iframe {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border: none;
+        }
+        .video-placeholder {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            color: white;
+            font-size: 18px;
+            background-color: #333;
+        }
+        .video-controls {
+            margin-top: 10px;
+            margin-bottom: 20px;
+        }
     </style>
 </head>
 <body>
@@ -185,6 +232,11 @@ HTML_TEMPLATE = """
             <li class="nav-item" role="presentation">
                 <button class="nav-link" id="location-tab" data-bs-toggle="tab" data-bs-target="#location-tab-pane" type="button" role="tab">
                     位置信息
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="video-tab" data-bs-toggle="tab" data-bs-target="#video-tab-pane" type="button" role="tab">
+                    视频流
                 </button>
             </li>
             <li class="nav-item" role="presentation">
@@ -313,6 +365,26 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
+            <!-- 视频流标签页 -->
+            <div class="tab-pane fade" id="video-tab-pane" role="tabpanel" aria-labelledby="video-tab" tabindex="0">
+                <div class="card">
+                    <div class="card-header">实时视频流</div>
+                    <div class="card-body">
+                        <div id="video-status" class="alert alert-info">正在检查视频流可用性...</div>
+                        <div class="video-container" id="video-frame-container">
+                            <div class="video-placeholder" id="video-placeholder">
+                                等待视频流连接...
+                            </div>
+                            <iframe id="video-frame" style="display:none;" allowfullscreen></iframe>
+                        </div>
+                        <div class="video-controls">
+                            <button class="btn btn-primary" id="refresh-video-btn">刷新视频流</button>
+                            <button class="btn btn-warning" id="fullscreen-btn">全屏显示</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- 原始数据标签页 -->
             <div class="tab-pane fade" id="json-tab-pane" role="tabpanel" aria-labelledby="json-tab" tabindex="0">
                 <div class="card">
@@ -330,6 +402,7 @@ HTML_TEMPLATE = """
         let map, marker;
         let lastValidLatLng = null;
         let activeTab = 'car';  // 默认显示车辆信息标签
+        let videoStreamUrl = null;
 
         // 根据车辆状态自动切换标签
         function autoSwitchTabs(isCarActive) {
@@ -709,92 +782,154 @@ HTML_TEMPLATE = """
             document.getElementById('detailed-vehicle-info-container').innerHTML = html;
         }
 
+        function updateVideo(data) {
+            // 检查视频流信息
+            const videoStatus = document.getElementById('video-status');
+            const videoFrame = document.getElementById('video-frame');
+            const videoPlaceholder = document.getElementById('video-placeholder');
+
+            if (data.video_stream && data.video_stream.available) {
+                videoStatus.className = 'alert alert-success';
+                videoStatus.textContent = '视频流可用，正在加载...';
+
+                // 获取视频流URL
+                const newVideoUrl = data.video_stream.url;
+
+                if (newVideoUrl && newVideoUrl !== videoStreamUrl) {
+                    videoStreamUrl = newVideoUrl;
+                    console.log('更新视频流URL:', videoStreamUrl);
+
+                    // 加载视频流
+                    videoFrame.src = videoStreamUrl;
+                    videoFrame.style.display = 'block';
+                    videoPlaceholder.style.display = 'none';
+
+                    videoFrame.onload = function() {
+                        videoStatus.textContent = '视频流已连接';
+                    };
+
+                    videoFrame.onerror = function() {
+                        videoStatus.className = 'alert alert-danger';
+                        videoStatus.textContent = '视频流连接失败';
+                        videoFrame.style.display = 'none';
+                        videoPlaceholder.style.display = 'flex';
+                        videoPlaceholder.textContent = '视频流连接失败，请检查网络或刷新';
+                    };
+                }
+            } else {
+                videoStatus.className = 'alert alert-warning';
+                videoStatus.textContent = '视频流不可用';
+                videoFrame.style.display = 'none';
+                videoPlaceholder.style.display = 'flex';
+                videoPlaceholder.textContent = '设备未提供视频流';
+                videoStreamUrl = null;
+            }
+        }
+
+        // 刷新视频按钮
+        document.getElementById('refresh-video-btn').addEventListener('click', function() {
+            if (videoStreamUrl) {
+                const videoFrame = document.getElementById('video-frame');
+                videoFrame.src = videoStreamUrl + '?t=' + new Date().getTime();
+            }
+        });
+
+        // 全屏按钮
+        document.getElementById('fullscreen-btn').addEventListener('click', function() {
+            const videoFrame = document.getElementById('video-frame');
+            if (videoFrame.requestFullscreen) {
+                videoFrame.requestFullscreen();
+            } else if (videoFrame.mozRequestFullScreen) {
+                videoFrame.mozRequestFullScreen();
+            } else if (videoFrame.webkitRequestFullscreen) {
+                videoFrame.webkitRequestFullscreen();
+            } else if (videoFrame.msRequestFullscreen) {
+                videoFrame.msRequestFullscreen();
+            }
+        });
+
+        // 更新所有UI
+        function updateUI(data) {
+            // 更新状态信息
+            updateStatusInfo(data);
+
+            // 更新各部分内容
+            if (data.car) {
+                const isCarMoving = updateVehicleStatus(data.car);
+                updateSteeringSystem(data.car);
+                updatePedalStatus(data.car);
+                updateDoorLights(data.car);
+                updateCruiseInfo(data);
+                updateCarDetails(data);
+
+                // 自动切换标签
+                autoSwitchTabs(isCarMoving);
+            }
+
+            if (data.device) {
+                updateDeviceInfo(data.device);
+                updateSystemResources(data.device);
+            }
+
+            if (data.location) {
+                updateGPSInfo(data.location);
+                if (data.location.gps_valid && data.location.latitude && data.location.longitude) {
+                    updateMap(data.location.latitude, data.location.longitude, data.location.bearing);
+                }
+            }
+
+            if (data.navigation) {
+                updateNavigation(data.navigation);
+            }
+
+            // 更新视频流
+            updateVideo(data);
+
+            // 更新原始数据
+            document.getElementById('raw-data').textContent = JSON.stringify(data, null, 2);
+        }
+
         function fetchData() {
             fetch('/api/data')
                 .then(response => response.json())
                 .then(data => {
-                    const statusContainer = document.getElementById('status-container');
-
-                    if (!data || !data.data || Object.keys(data.data).length === 0) {
-                        statusContainer.className = 'status waiting';
-                        statusContainer.textContent = '等待来自comma3的数据...';
-                        return;
+                    if (data.status === 'ok') {
+                        updateUI(data.data);
+                    } else {
+                        console.error('API错误:', data.message);
                     }
-
-                    const currentTime = new Date().getTime() / 1000;
-                    if (currentTime - data.last_update > 5) {
-                        statusContainer.className = 'status expired';
-                        statusContainer.textContent = `数据已过期! 上次更新: ${new Date(data.last_update * 1000).toLocaleTimeString()}`;
-                        return;
-                    }
-
-                    // 数据有效，更新UI
-                    statusContainer.className = 'status connected';
-                    statusContainer.textContent = `已连接到 ${data.device_ip || 'Comma3设备'} - 最后更新: ${new Date(data.last_update * 1000).toLocaleTimeString()}`;
-
-                    // 获取数据
-                    const carData = data.data.car || {};
-                    const deviceData = data.data.device || {};
-                    const locationData = data.data.location || {};
-                    const navData = data.data.navigation || {};
-
-                    // 先更新车辆状态，并获取车辆是否启动
-                    const isCarActive = updateVehicleStatus(carData);
-
-                    // 根据车辆状态自动切换标签页
-                    autoSwitchTabs(isCarActive);
-
-                    // 更新所有数据区域
-                    updateSteeringSystem(carData);
-                    updatePedalStatus(carData);
-                    updateDoorLights(carData);
-                    updateCruiseInfo(carData);
-                    updateDeviceInfo(deviceData);
-                    updateSystemResources(deviceData);
-                    updateGpsInfo(locationData);
-                    updateNavigation(navData);
-                    updateDetailedVehicleInfo(data.data.car_info);
-
-                    // 更新原始数据
-                    document.getElementById('raw-data').textContent = JSON.stringify(data.data, null, 2);
                 })
                 .catch(error => {
-                    console.error('获取数据出错:', error);
-                    document.getElementById('status-container').className = 'status expired';
-                    document.getElementById('status-container').textContent = '连接错误: ' + error.message;
+                    console.error('获取数据错误:', error);
                 });
         }
 
-        // 标签页切换处理
+        // 初始加载
         document.addEventListener('DOMContentLoaded', function() {
-            const tabEls = document.querySelectorAll('button[data-bs-toggle="tab"]');
-            tabEls.forEach(tabEl => {
-                tabEl.addEventListener('shown.bs.tab', function (event) {
-                    // 更新当前活动标签
-                    const id = event.target.id;
-                    if (id.includes('car')) activeTab = 'car';
-                    else if (id.includes('device')) activeTab = 'device';
-                    else if (id.includes('location')) activeTab = 'location';
-                    else activeTab = 'json';
-                });
-            });
-
             fetchData();
 
-            // 设置自动刷新
+            // 定时刷新
             const autoRefreshCheckbox = document.getElementById('auto-refresh');
-            let refreshInterval;
+            let refreshInterval = null;
 
             function setAutoRefresh() {
                 if (autoRefreshCheckbox.checked) {
                     refreshInterval = setInterval(fetchData, 1000);
-                } else {
+                } else if (refreshInterval) {
                     clearInterval(refreshInterval);
+                    refreshInterval = null;
                 }
             }
 
             autoRefreshCheckbox.addEventListener('change', setAutoRefresh);
             setAutoRefresh();
+
+            // 地图初始化
+            if (typeof google !== 'undefined') {
+                initMap();
+            } else {
+                console.log('Google Maps API未加载');
+            }
         });
     </script>
 
